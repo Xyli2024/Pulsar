@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pulsar"
+version = "0.1.0"
+description = "A live, terminal-native hardware dashboard for developers and researchers."
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Xinyu Li", email = "xinyul3@andrew.cmu.edu"}
+]
+requires-python = ">=3.10"
+dependencies = [
+    "psutil>=5.9",
+    "rich>=13.0",
+    "click>=8.0",
+]
+
+[project.scripts]
+pulsar = "pulsar.cli:main"
