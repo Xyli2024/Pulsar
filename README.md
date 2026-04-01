@@ -62,6 +62,13 @@ pulsar --disco
 - `rich >= 13.0`
 - `click >= 8.0`
 
+## Contributors
+
+| Name | Role |
+|---|---|
+| [Xinyu Li](https://github.com/Xyli2024) | Author |
+| [Claude (Anthropic)](https://www.anthropic.com/claude) | AI Assistant |
+
 ## License
 
 MIT — see [LICENSE](LICENSE) for details.
