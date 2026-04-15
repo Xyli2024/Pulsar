@@ -79,7 +79,10 @@ def _get_gpu_model() -> str:
 
 def get_system_info() -> SystemInfo:
     """Read static hardware identity. Call once at startup."""
-    freq = psutil.cpu_freq()
+    try:
+        freq = psutil.cpu_freq()
+    except AttributeError:
+        freq = None
     current_ghz = round(freq.current / 1000, 2) if freq else 0.0
     max_ghz = round(freq.max / 1000, 2) if freq and freq.max else current_ghz
 
