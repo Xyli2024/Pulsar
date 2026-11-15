@@ -10,15 +10,20 @@ import signal
 import sys
 import threading
 import time
+from collections import deque
 
-from rich.console import Console, Group
+from rich.console import Console, ConsoleOptions, Group, RenderableType, RenderResult
+from rich.control import Control
 from rich.live import Live
 from rich.panel import Panel
+from rich.screen import Screen
 from rich.table import Table
 from rich.text import Text
 
 from .collector import SystemInfo, Snapshot, collect
 from . import facts as _facts
+from . import theme as th
+from .theme import DISCO_COLORS
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -32,12 +37,6 @@ MILESTONES = [
     (60 * 60, "1 hour. At this point, you live here. We've prepared a small room."),
 ]
 
-
-DISCO_COLORS = [
-    "red", "green", "yellow", "blue", "magenta", "cyan",
-    "bright_red", "bright_green", "bright_yellow",
-    "bright_blue", "bright_magenta", "bright_cyan",
-]
 
 # Fireworks animation
 _FW_TOTAL_FRAMES   = 25    # frames per show
@@ -62,7 +61,7 @@ _ANSI_RST  = "\033[0m"
 # Fact bar animation
 _TYPING_SECS    = 20.0   # target duration to type full body text
 _STABLE_SECS    = 10.0   # static display time after typing completes
-_FADE_PALETTE   = ["white", "grey74", "grey54", "grey39", "grey27", "grey15", "grey7"]
+_FADE_PALETTE   = [th.TEXT,"grey74", "grey54", "grey39", "grey27", "grey15", "grey7"]
 _FADE_STEP_SECS = 0.125  # seconds per fade step  (7 × 0.125 ≈ 875 ms total)
 _LOOP_TICK      = 0.10   # main loop tick; collect() is gated separately by interval
 _MIN_CHARS_SEC  = 9.0    # slowest allowed typing speed (chars / sec)
@@ -129,21 +128,24 @@ def _start_keyboard_thread(key_queue: queue.Queue, stop_event: threading.Event) 
 # Rendering helpers
 # ---------------------------------------------------------------------------
 
-def _bar(pct: float, width: int = 20) -> str:
-    filled = max(0, min(int(pct / 100 * width), width))
-    return "█" * filled + "░" * (width - filled)
+class _History:
+    """Rolling per-metric history used for the sparklines."""
 
+    def __init__(self, maxlen: int = 240) -> None:
+        self.cpu      = deque(maxlen=maxlen)
+        self.mem      = deque(maxlen=maxlen)
+        self.net_down = deque(maxlen=maxlen)
+        self.net_up   = deque(maxlen=maxlen)
+        self.disk_r   = deque(maxlen=maxlen)
+        self.disk_w   = deque(maxlen=maxlen)
 
-def _color(pct: float, disco: bool = False) -> str:
-    if disco:
-        return random.choice(DISCO_COLORS)
-    return "green" if pct < 50 else "yellow" if pct < 80 else "red"
-
-
-def _mem_color(pct: float, disco: bool = False) -> str:
-    if disco:
-        return random.choice(DISCO_COLORS)
-    return "green" if pct < 70 else "yellow" if pct < 90 else "red"
+    def push(self, snap: Snapshot) -> None:
+        self.cpu.append(snap.cpu_avg)
+        self.mem.append(snap.mem_percent)
+        self.net_down.append(snap.net_recv_mbps)
+        self.net_up.append(snap.net_sent_mbps)
+        self.disk_r.append(snap.disk_read_mbps)
+        self.disk_w.append(snap.disk_write_mbps)
 
 
 # ---------------------------------------------------------------------------
@@ -230,118 +232,413 @@ def _draw_sparkle_overlay(
 # Dashboard panel builders
 # ---------------------------------------------------------------------------
 
-def _build_header(info: SystemInfo, interval: float, disco: bool = False) -> Panel:
-    c = random.choice(DISCO_COLORS) if disco else "cyan"
-    t = Text()
-    t.append("pulsar", style=f"bold {c}")
-    t.append(
-        f"  •  {info.cpu_model}  •  {info.cpu_cores} cores"
-        f"  •  {info.cpu_freq_current} / {info.cpu_freq_max} GHz max\n",
-        style="white",
+def _panel(body, title: str, icon: str, *, subtitle: str | None = None,
+           accent: str = th.ACCENT, border: str = th.BORDER,
+           disco: bool = False) -> Panel:
+    """Uniform rounded panel with an icon + uppercase title on the top-left."""
+    head = Text()
+    head.append(f" {icon} ", style=f"bold {th.pick(accent, disco)}")
+    head.append(f"{title.upper()} ", style=f"bold {th.TEXT}")
+    sub = Text(f" {subtitle} ", style=th.MUTED) if subtitle else None
+    return Panel(
+        body,
+        title=head, title_align="left",
+        subtitle=sub, subtitle_align="right",
+        box=th.PANEL_BOX,
+        border_style=th.pick(border, disco),
+        padding=(0, 1),
     )
-    t.append(
-        f"GPU: {info.gpu_model}  •  RAM: {info.ram_total} GB"
-        f"  •  refresh: {interval}s"
-        f"  •  [dim]k[/dim] kill (SIGTERM)  •  [dim]K[/dim] force kill (SIGKILL)"
-        f"  •  [dim]y[/dim] fireworks  •  [dim]q[/dim] quit",
-        style="dim",
-    )
-    return Panel(t)
 
 
-def _build_cpu_text(snap: Snapshot, disco: bool = False) -> Text:
-    t = Text()
-    n = len(snap.cpu_per_core)
+def _build_header(info: SystemInfo, interval: float, elapsed: float = 0.0,
+                  disco: bool = False) -> Panel:
+    accent = th.pick(th.ACCENT, disco)
 
-    has_freq = len(snap.cpu_freq_per_core) == n
-    if n <= 8:
-        for i, pct in enumerate(snap.cpu_per_core):
-            c = _color(pct, disco)
-            t.append(f"Core {i}  ", style="dim")
-            t.append(_bar(pct), style=c)
-            t.append(f"  {pct:5.1f}%", style=c)
-            if has_freq:
-                t.append(f"  {snap.cpu_freq_per_core[i]:.2f} GHz", style="dim")
+    # Row 1 — logo on the left, session status on the right
+    logo = Text()
+    logo.append("◉" if int(elapsed) % 2 == 0 else "◎", style=f"bold {accent}")
+    logo.append(" P U L S A R", style=f"bold {th.TEXT}")
+    logo.append("   live hardware monitor", style=th.MUTED)
+
+    status = Text(justify="right")
+    if interval > 0:
+        th.kv(status, "session ", th.fmt_duration(elapsed))
+        status.append("   ·   ", style=th.FAINT)
+        th.kv(status, "every ", f"{interval:g}s")
+    else:  # one-shot (--once) output
+        status.append("snapshot", style=th.MUTED)
+    status.append("   ·   ", style=th.FAINT)
+    status.append(time.strftime("%H:%M:%S"), style=f"bold {accent}")
+
+    # Row 2 — static machine identity
+    ident = Text(overflow="ellipsis")
+    th.kv(ident, "CPU ", info.cpu_model)
+    ident.append(f" · {info.cpu_cores} threads", style=th.MUTED)
+    freq = th.freq_text(info.cpu_freq_current, info.cpu_freq_max)
+    if freq:
+        ident.append(f" · {freq}", style=th.MUTED)
+    ident.append("    ")
+    th.kv(ident, "GPU ", info.gpu_model)
+    ident.append("    ")
+    th.kv(ident, "RAM ", f"{info.ram_total} GB")
+
+    grid = Table.grid(expand=True)
+    grid.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
+    grid.add_column(justify="right", no_wrap=True)
+    grid.add_row(logo, status)
+    body = Group(grid, ident)
+    return Panel(body, box=th.PANEL_BOX, border_style=th.pick(th.BORDER, disco),
+                 padding=(0, 1))
+
+
+class _CpuView:
+    """Width-aware CPU body: average gauge, history sparkline, per-core grid."""
+
+    _GAP = 3  # spaces between core columns
+
+    def __init__(self, snap: Snapshot, history: "_History | None", disco: bool) -> None:
+        self.snap, self.history, self.disco = snap, history, disco
+
+    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        snap, disco = self.snap, self.disco
+        w = max(20, options.max_width)
+        cores = snap.cpu_per_core
+        n = len(cores)
+        freqs = snap.cpu_freq_per_core if len(snap.cpu_freq_per_core) == n else [None] * n
+        has_freq = any(f is not None for f in freqs)
+
+        t = Text(no_wrap=True, overflow="crop")
+
+        # Average gauge — label (5) + bar + value (7)
+        avg_c = th.level(snap.cpu_avg, disco=disco)
+        t.append("AVG  ", style=f"bold {th.MUTED}")
+        t.append_text(th.bar(snap.cpu_avg, w - 12, disco))
+        t.append(f" {snap.cpu_avg:5.1f}%", style=f"bold {avg_c}")
+        t.append("\n")
+
+        # History sparkline, aligned under the bar (live mode only)
+        if self.history is not None:
+            t.append("     ")
+            t.append_text(th.sparkline(self.history.cpu, w - 12, color=None,
+                                       floor=100.0, disco=disco))
+            t.append("  hist", style=th.FAINT)
             t.append("\n")
-        t.append("─" * (44 if has_freq else 34) + "\n", style="dim")
-        c = _color(snap.cpu_avg, disco)
-        t.append("avg     ", style="dim")
-        t.append(_bar(snap.cpu_avg), style=c)
-        t.append(f"  {snap.cpu_avg:5.1f}%", style=f"bold {c}")
-    else:
-        c = _color(snap.cpu_avg, disco)
-        t.append(f"avg {snap.cpu_avg:.1f}%  ", style=f"bold {c}")
-        t.append(_bar(snap.cpu_avg) + "\n\n", style=c)
-        for row_start in range(0, n, 4):
-            row = snap.cpu_per_core[row_start: row_start + 4]
-            for j in range(len(row)):
-                t.append(f"  {row_start + j:>3}  ", style="dim")
-            t.append("\n")
-            for pct in row:
-                t.append(f" {pct:5.1f}%", style=_color(pct, disco))
-            t.append("\n\n")
-    return t
+        t.append("\n")
+
+        # Per-core grid, laid out column-major
+        label_w = len(str(max(n - 1, 0))) + 2          # "C" + digits + space
+        fixed = label_w + 5 + (6 if has_freq else 0)   # + " 100%" (+ " 3.20G")
+        cols = 1 if n <= 8 else 2 if n <= 24 else 3
+        while cols > 1 and (w - self._GAP * (cols - 1)) // cols - fixed < 6:
+            cols -= 1
+        cell_w = (w - self._GAP * (cols - 1)) // cols
+        bar_w = max(3, cell_w - fixed)
+        rows = math.ceil(n / cols) if n else 0
+
+        for r in range(rows):
+            for c in range(cols):
+                i = c * rows + r
+                if i >= n:
+                    continue
+                if c:
+                    t.append(" " * self._GAP)
+                pct = cores[i]
+                t.append(f"C{i:<{label_w - 1}}", style=th.MUTED)
+                t.append_text(th.bar(pct, bar_w, disco))
+                t.append(f" {pct:3.0f}%", style=th.level(pct, disco=disco))
+                if has_freq:
+                    f = freqs[i]
+                    t.append(f" {f:4.2f}G" if f is not None else "      ", style=th.FAINT)
+            if r < rows - 1:
+                t.append("\n")
+        yield t
 
 
-def _build_stats_text(snap: Snapshot, disco: bool = False) -> Text:
-    t = Text()
-    mc = _mem_color(snap.mem_percent, disco)
-    t.append("Memory\n", style="bold")
-    t.append(f"  {snap.mem_used} / {snap.mem_total} GB  ({snap.mem_percent:.1f}%)\n", style=mc)
-    t.append("  " + _bar(snap.mem_percent) + "\n\n", style=mc)
-    dc = random.choice(DISCO_COLORS) if disco else "white"
-    t.append("Disk I/O\n", style="bold")
-    t.append(f"  Read   {snap.disk_read_mbps:7.2f} MB/s\n", style=dc)
-    t.append(f"  Write  {snap.disk_write_mbps:7.2f} MB/s\n\n", style=dc)
-    nc = random.choice(DISCO_COLORS) if disco else "cyan"
-    t.append("Network I/O\n", style="bold")
-    t.append(f"  ↓ Recv  {snap.net_recv_mbps:7.2f} MB/s\n", style=nc)
-    t.append(f"  ↑ Sent  {snap.net_sent_mbps:7.2f} MB/s", style=nc)
-    return t
+class _SystemView:
+    """Width-aware system body: memory, I/O with sparklines, power, sensors."""
+
+    _LABEL_W = 8
+
+    def __init__(self, snap: Snapshot, history: "_History | None", disco: bool,
+                 compact: bool = False) -> None:
+        self.snap, self.history, self.disco = snap, history, disco
+        self.compact = compact
+
+    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        snap, disco, hist = self.snap, self.disco, self.history
+        w = max(20, options.max_width)
+        L = self._LABEL_W
+        t = Text(no_wrap=True, overflow="crop")
+
+        def head(title: str, first: bool = False) -> None:
+            if not first:
+                t.append("\n" if self.compact else "\n\n")
+            t.append_text(th.section(title, th.pick(th.ACCENT2, disco)))
+
+        def append_pairs(cells: list[Text]) -> None:
+            for index in range(0, len(cells), 2):
+                pair = cells[index:index + 2]
+                joined = Text("  ").join(pair)
+                for line in ([joined] if joined.cell_len <= options.max_width else pair):
+                    t.append("\n")
+                    t.append_text(line)
+
+        # --- Memory ------------------------------------------------------
+        head("Memory", first=True)
+        mc = th.level(snap.mem_percent, 70, 90, disco)
+        capacity = f"{snap.mem_used:.2f} / {snap.mem_total} GB"
+        memory_inline = self.compact and w - L - 9 - len(capacity) >= 3
+        t.append(f"\n{'used':<{L}}", style=th.MUTED)
+        memory_bar_width = w - L - 7 - (len(capacity) + 2 if memory_inline else 0)
+        t.append_text(th.bar(snap.mem_percent, memory_bar_width, disco))
+        t.append(f" {snap.mem_percent:5.1f}%", style=f"bold {mc}")
+        t.append("  " if memory_inline else f"\n{'':<{L}}", style=th.MUTED)
+        t.append(f"{snap.mem_used:.2f}", style=th.TEXT)
+        t.append(f" / {snap.mem_total} GB", style=th.MUTED)
+
+        # --- I/O ---------------------------------------------------------
+        head("Throughput")
+        rows = (
+            ("net ↓",  snap.net_recv_mbps,   hist.net_down if hist else None, th.NET_DOWN),
+            ("net ↑",  snap.net_sent_mbps,   hist.net_up   if hist else None, th.NET_UP),
+            ("disk r", snap.disk_read_mbps,  hist.disk_r   if hist else None, th.DISK_R),
+            ("disk w", snap.disk_write_mbps, hist.disk_w   if hist else None, th.DISK_W),
+        )
+        spark_w = w - L - 11 - 2
+        compact_rates = []
+        for label, value, series, color in rows:
+            c = th.pick(color, disco)
+            if self.compact:
+                rate = Text.assemble((f"{label} ", th.MUTED), (th.fmt_rate(value), f"bold {c}"))
+                compact_spark = (w - 2) // 2 - rate.cell_len - 1
+                if series is not None and compact_spark >= 4:
+                    rate.append(" ").append_text(th.sparkline(series, compact_spark, c, floor=0.05, disco=disco))
+                compact_rates.append(rate)
+                continue
+            t.append(f"\n{label:<{L}}", style=th.MUTED)
+            t.append(th.fmt_rate(value), style=f"bold {c}")
+            if series is not None and spark_w >= 4:
+                t.append("  ")
+                t.append_text(th.sparkline(series, spark_w, c, floor=0.05, disco=disco))
+        if self.compact:
+            append_pairs(compact_rates)
+
+        # --- Power -------------------------------------------------------
+        readings = [
+            ("adapter", snap.adapter_w, 1),
+            ("battery", snap.battery_w, 1),
+            ("system",  snap.system_w,  1),
+            ("cpu",     snap.cpu_w,     2),
+            ("gpu",     snap.gpu_w,     2),
+        ]
+        readings = [r for r in readings if r[1] is not None]
+        if readings:
+            head("Power")
+            pc = th.pick(th.POWER, disco)
+            compact_power = []
+            for label, watts, decimals in readings:
+                sign = "+" if label == "battery" and watts > 0 else ""
+                if self.compact:
+                    compact_power.append(Text.assemble(
+                        (f"{label} ", th.MUTED), (f"{sign}{watts:.{decimals}f}", f"bold {pc}"), (" W", th.MUTED),
+                    ))
+                    continue
+                t.append(f"\n{label:<{L}}", style=th.MUTED)
+                t.append(f"{sign}{watts:.{decimals}f}".rjust(7), style=f"bold {pc}")
+                t.append(" W", style=th.MUTED)
+            if self.compact:
+                append_pairs(compact_power)
+
+        # --- Sensors -----------------------------------------------------
+        has_sensors = (snap.gpu_percent is not None or snap.temperatures_c
+                       or snap.fans_rpm or snap.battery_percent is not None
+                       or snap.battery_status)
+        if has_sensors:
+            head("Sensors")
+            sensor_width = max(1, options.max_width - L)
+
+            def sensor_line(label: str, value: Text) -> None:
+                for index, line in enumerate(value.wrap(console, sensor_width, overflow="fold")):
+                    t.append(f"\n{label if index == 0 else '':<{L}}", style=th.MUTED)
+                    t.append_text(line)
+
+            if snap.gpu_percent is not None:
+                g = snap.gpu_percent
+                t.append(f"\n{'gpu':<{L}}", style=th.MUTED)
+                t.append_text(th.bar(g, w - L - 7, disco))
+                t.append(f" {g:5.0f}%", style=f"bold {th.level(g, disco=disco)}")
+            if snap.temperatures_c:
+                temperatures = snap.temperatures_c.items()
+                full = "  ".join(f"{label} {value:.0f}°" for label, value in temperatures)
+                compact = Text(full).cell_len > sensor_width
+                parts = [Text.assemble(
+                    (f"{label} ", th.MUTED),
+                    (f"{value:.0f}{'' if compact else '°'}", f"bold {th.level(value, 60, 85, disco)}"),
+                ) for label, value in temperatures]
+                sensor_line("temp °C" if compact else "temp", Text(" " if compact else "  ").join(parts))
+            if snap.fans_rpm:
+                t.append(f"\n{'fans':<{L}}", style=th.MUTED)
+                for j, (index, rpm) in enumerate(snap.fans_rpm.items()):
+                    if j:
+                        t.append("  ")
+                    t.append(f"F{index} ", style=th.MUTED)
+                    t.append(f"{rpm:.0f}", style=f"bold {th.pick(th.TEXT, disco)}")
+                t.append(" rpm", style=th.MUTED)
+            if snap.battery_percent is not None or snap.battery_status:
+                details = Text()
+                if snap.battery_percent is not None:
+                    b = snap.battery_percent
+                    bc = th.pick(th.OK if b > 40 else th.WARN if b > 15 else th.HOT, disco)
+                    details.append(f"{b:.0f}%", style=f"bold {bc}")
+                if snap.battery_status:
+                    if details:
+                        details.append("  ")
+                    details.append(snap.battery_status, style=th.MUTED)
+                if snap.battery_percent is not None:
+                    bar_width = min(max(4, min(12, w - L - 22)), sensor_width - details.cell_len - 1)
+                    if bar_width > 0:
+                        details = th.bar(b, bar_width, color=bc).append(" ").append_text(details)
+                sensor_line("battery", details)
+        yield t
 
 
 def _build_fact_bar(fact: dict, char_pos: int, anim_state: str,
-                    fade_step: int = 0) -> Panel:
+                    fade_step: int = 0, disco: bool = False,
+                    compact: bool = False) -> Panel | Text:
     tag_color = fact.get("color", "white")
     body      = fact["text"]
     t = Text()
-    t.append("  ")
 
     if anim_state == "fading":
         fade_color = _FADE_PALETTE[min(fade_step, len(_FADE_PALETTE) - 1)]
-        t.append(fact["tag"], style=f"bold {fade_color}")
+        t.append(f" {fact['tag']} ", style=f"bold {fade_color}")
         t.append("  ")
         t.append(body, style=fade_color)
-    elif anim_state == "typing":
-        t.append(fact["tag"], style=f"bold {tag_color}")
+    else:
+        # Tag rendered as a solid "chip" in the fact's category color
+        t.append(f" {fact['tag']} ", style=f"bold black on {tag_color}")
         t.append("  ")
-        t.append(body[:char_pos], style="white")
-        if char_pos < len(body):
-            pac = "ᗧ" if char_pos % 2 == 0 else "ᗦ"
-            t.append(pac, style="bold yellow")
-    else:  # stable
-        t.append(fact["tag"], style=f"bold {tag_color}")
-        t.append("  ")
-        t.append(body, style="white")
+        if anim_state == "typing":
+            t.append(body[:char_pos], style=th.TEXT)
+            if char_pos < len(body):
+                pac = "ᗧ" if char_pos % 2 == 0 else "ᗦ"
+                t.append(pac, style="bold yellow")
+                # Remaining text shown as pellets for Pac-Man to eat
+                dots = min(len(body) - char_pos - 1, 6)
+                t.append(" ·" * (dots // 2), style=th.FAINT)
+        else:  # stable
+            t.append(body, style=th.TEXT)
 
-    return Panel(t, border_style="dim")
+    if compact:
+        t.no_wrap, t.overflow = True, "ellipsis"
+        return t
+    return Panel(t, box=th.PANEL_BOX, border_style=th.pick(th.FAINT, disco),
+                 padding=(0, 1))
+
+
+def _build_keys_bar(disco: bool = False) -> Text:
+    """Bottom key-hint strip with keycap-style chips."""
+    cap = f"bold #1a1b26 on {th.pick(th.ACCENT, disco)}"
+    t = Text(no_wrap=True, overflow="ellipsis")
+    t.append(" ")
+    for key, label in (("q", "quit"), ("k", "kill"), ("K", "force kill"),
+                       ("y", "fireworks")):
+        t.append(f" {key} ", style=cap)
+        t.append(f" {label}   ", style=th.MUTED)
+    if disco:
+        t.append(" ♪ DISCO ♪ ", style=f"bold {th.disco_color()}")
+    return t
 
 
 def _build_kill_prompt(kill_input: str, sig: signal.Signals) -> Panel:
     sig_name  = "SIGKILL" if sig == signal.SIGKILL else "SIGTERM"
-    sig_color = "red"     if sig == signal.SIGKILL else "yellow"
+    sig_color = th.HOT    if sig == signal.SIGKILL else th.WARN
     t = Text()
-    t.append("  ")
-    t.append(sig_name, style=f"bold {sig_color}")
-    t.append("  PID or process name:  ")
-    t.append(kill_input, style="bold white")
-    t.append("█", style="dim")
-    t.append("\n  ")
-    t.append("Enter", style="dim")
-    t.append(" confirm  •  ")
-    t.append("Esc", style="dim")
-    t.append(" cancel")
-    return Panel(t, title="Kill Process", border_style=sig_color)
+    t.append(f" {sig_name} ", style=f"bold #1a1b26 on {sig_color}")
+    t.append("   target ", style=th.MUTED)
+    t.append("› ", style=f"bold {sig_color}")
+    t.append(kill_input, style=f"bold {th.TEXT}")
+    t.append("▌", style=f"blink {th.ACCENT}")
+    t.append("\n")
+    t.append(" ⏎ ", style=f"bold {th.TEXT}")
+    t.append("confirm   ", style=th.MUTED)
+    t.append(" esc ", style=f"bold {th.TEXT}")
+    t.append("cancel   ", style=th.MUTED)
+    t.append("· PID, or part of a listed process name", style=th.FAINT)
+    return _panel(t, "Kill process", "✖", accent=sig_color, border=sig_color)
+
+
+class _HardwarePanels:
+    def __init__(self, cpu, system, cpu_sub: str | None = None,
+                 disco: bool = False) -> None:
+        self.cpu = cpu
+        self.system = system
+        self.cpu_sub = cpu_sub
+        self.disco = disco
+
+    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        cpu = _panel(self.cpu, "Processor", "◆", subtitle=self.cpu_sub, disco=self.disco)
+        system = _panel(self.system, "System", "◇", accent=th.ACCENT2, disco=self.disco)
+        cpu_width = (options.max_width * 3 + 4) // 5
+        system_width = options.max_width - cpu_width
+        if system_width < 12:
+            yield cpu
+            yield system
+            return
+
+        # Count wrapped rows at each column's actual width before adding padding.
+        cpu_height = len(console.render_lines(cpu, options.update(width=cpu_width, height=None)))
+        system_height = len(console.render_lines(system, options.update(width=system_width, height=None)))
+        cpu.height = system.height = max(cpu_height, system_height)
+
+        grid = Table.grid(expand=True)
+        grid.add_column(width=cpu_width)
+        grid.add_column(width=system_width)
+        grid.add_row(cpu, system)
+        yield grid
+
+
+def _build_hardware(snap: Snapshot, history: "_History | None",
+                    disco: bool = False, compact: bool = False) -> _HardwarePanels:
+    n = len(snap.cpu_per_core)
+    has_freq = (len(snap.cpu_freq_per_core) == n
+                and any(f is not None for f in snap.cpu_freq_per_core))
+    cpu_sub = f"{n} threads" + (" · freq in GHz" if has_freq else "")
+    return _HardwarePanels(_CpuView(snap, history, disco), _SystemView(snap, history, disco, compact),
+                           cpu_sub=cpu_sub, disco=disco)
+
+
+def _build_procs(snap: Snapshot, milestone_msg: str | None, disco: bool) -> Panel:
+    table = Table(
+        show_header=True, header_style=f"bold {th.MUTED}", box=None,
+        padding=(0, 1), expand=True, show_edge=False,
+    )
+    table.add_column("#",    justify="right", width=2, style=th.FAINT)
+    table.add_column("PID",  justify="right", width=7, style=th.MUTED)
+    table.add_column("NAME", ratio=1, min_width=12, no_wrap=True, overflow="ellipsis")
+    table.add_column("CPU",  width=17, no_wrap=True)
+    table.add_column("MEM",  justify="right", width=9, no_wrap=True)
+
+    for rank, p in enumerate(snap.top_procs, start=1):
+        cpu_c = th.level(p["cpu"], disco=disco)
+        cpu_cell = th.bar(p["cpu"], 10, disco)
+        cpu_cell.append(f" {p['cpu']:5.1f}%", style=f"bold {cpu_c}")
+        name_style = f"bold {th.TEXT}" if rank == 1 else th.TEXT
+        table.add_row(
+            str(rank), str(p["pid"]), Text(p["name"], style=name_style),
+            cpu_cell, Text(th.fmt_mem(p["mem_mb"]), style=th.TEXT),
+        )
+    if not snap.top_procs:
+        table.add_row("", "", Text("no matching processes", style=f"italic {th.MUTED}"), "", "")
+
+    body: list = [table]
+    if milestone_msg:
+        note = Text()
+        note.append("\n★ ", style=f"bold {th.WARN}")
+        note.append(milestone_msg, style=f"bold {th.WARN}")
+        body.append(note)
+    return _panel(Group(*body), "Top processes", "▤", subtitle="sorted by CPU",
+                  accent=th.OK, disco=disco)
 
 
 def _build_renderable(info: SystemInfo, snap: Snapshot, interval: float,
@@ -351,46 +648,73 @@ def _build_renderable(info: SystemInfo, snap: Snapshot, interval: float,
                       fact: dict | None = None,
                       fact_char_pos: int = 0,
                       fact_anim_state: str = "stable",
-                      fact_fade_step: int = 0) -> Group:
+                      fact_fade_step: int = 0,
+                      history: "_History | None" = None,
+                      elapsed: float = 0.0,
+                      compact: bool = False) -> Group:
     """Compose the full dashboard as a Rich renderable Group."""
-    header = _build_header(info, interval, disco)
+    header = _build_header(info, interval, elapsed, disco)
+    hardware = _build_hardware(snap, history, disco, compact)
+    procs = _build_procs(snap, milestone_msg, disco)
 
-    grid = Table.grid(expand=True)
-    grid.add_column(ratio=3)
-    grid.add_column(ratio=2)
-    grid.add_row(
-        Panel(_build_cpu_text(snap, disco),   title="CPU",    border_style="dim"),
-        Panel(_build_stats_text(snap, disco), title="System", border_style="dim"),
-    )
-
-    proc_table = Table(show_header=True, header_style="bold dim", box=None, padding=(0, 1))
-    proc_table.add_column("PID",  justify="right", width=7)
-    proc_table.add_column("Name", width=26)
-    proc_table.add_column("CPU%", justify="right", width=6)
-    proc_table.add_column("MEM",  justify="right", width=10)
-    for p in snap.top_procs:
-        c = _color(p["cpu"], disco)
-        mem_str = (f"{p['mem_mb']} MB" if p["mem_mb"] < 1024
-                   else f"{p['mem_mb'] / 1024:.2f} GB")
-        proc_table.add_row(
-            str(p["pid"]), p["name"],
-            f"[{c}]{p['cpu']}%[/{c}]", mem_str,
-        )
-
-    footer = Text(f"\n  ★  {milestone_msg}", style="bold yellow") if milestone_msg else Text()
-    procs = Panel(Group(proc_table, footer), title="Top Processes", border_style="dim")
-
-    fact_bar = (
-        _build_fact_bar(fact, fact_char_pos, fact_anim_state, fact_fade_step)
-        if fact else None
-    )
-
-    parts: list = [header, grid, procs]
+    parts: list = [header, hardware, procs]
     if kill_prompt is not None:
         parts.append(kill_prompt)
-    if fact_bar is not None:
-        parts.append(fact_bar)
+    if fact:
+        parts.append(_build_fact_bar(fact, fact_char_pos, fact_anim_state,
+                                     fact_fade_step, disco, compact))
+    parts.append(_build_keys_bar(disco))
     return Group(*parts)
+
+
+# ---------------------------------------------------------------------------
+# Main-buffer painter (Apple Terminal)
+# ---------------------------------------------------------------------------
+
+def _use_main_screen() -> bool:
+    """Apple Terminal shows its scrollback above the alternate screen and can
+    leave the view parked in history, so the dashboard starts below a page of
+    blank lines.  There we paint in place on the normal buffer instead."""
+    return os.environ.get("TERM_PROGRAM") == "Apple_Terminal"
+
+
+class _MainScreenLive:
+    """Minimal stand-in for ``Live(screen=True)`` that never switches buffers.
+
+    On entry the shell's visible lines are scrolled up into the scrollback
+    (nothing is erased), then each refresh homes the cursor and overwrites the
+    whole window with a full-size frame, so no clear sequences are needed.
+    """
+
+    def __init__(self, renderable: RenderableType, console: Console) -> None:
+        self.console = console
+        self._renderable = renderable
+
+    def __enter__(self) -> "_MainScreenLive":
+        self.console.show_cursor(False)
+        # From any cursor row, height-1 newlines push every line that already
+        # holds output into the scrollback and leave a blank window.
+        self.console.file.write("\n" * (self.console.height - 1))
+        self.refresh()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        # Leave the last frame in place and continue below it.
+        self.console.file.write("\r\n")
+        self.console.show_cursor(True)
+        self.console.file.flush()
+
+    def update(self, renderable: RenderableType, refresh: bool = False) -> None:
+        self._renderable = renderable
+        if refresh:
+            self.refresh()
+
+    def refresh(self) -> None:
+        # Screen pads/crops to exactly the window size without a trailing
+        # newline, so the frame can never scroll the window.
+        with self.console:  # buffer the frame into a single write
+            self.console.control(Control.home())
+            self.console.print(Screen(self._renderable), end="")
 
 
 # ---------------------------------------------------------------------------
@@ -423,7 +747,6 @@ def run(info: SystemInfo, interval: float = 1.0, top_n: int = 5,
     kill_sig   = signal.SIGTERM
 
     # Facts animation state
-    _facts.start_online_fetch()
     fact_idx            = 0
     current_fact        = _facts.get_fact(0)
     milestone_override: dict | None = None  # when set, shown instead of current_fact
@@ -447,12 +770,45 @@ def run(info: SystemInfo, interval: float = 1.0, top_n: int = 5,
     time.sleep(min(interval, 0.3))
     snap = collect(top_n=top_n, proc_filter=proc_filter)  # initial reading
     last_collect_time = time.monotonic()
+    history = _History()
+    history.push(snap)
 
-    with Live(console=console, screen=True, auto_refresh=False) as live:
+    def render(kill_prompt: Panel | None = None) -> Group:
+        # Reads the loop's current state from the enclosing scope at call time.
+        return _build_renderable(info, snap, interval,
+                                 milestone_msg=milestone_msg, disco=disco,
+                                 kill_prompt=kill_prompt,
+                                 fact=milestone_override or current_fact,
+                                 fact_char_pos=fact_char_pos,
+                                 fact_anim_state=fact_anim_state,
+                                 fact_fade_step=fact_fade_step,
+                                 history=history,
+                                 elapsed=time.monotonic() - start_time,
+                                 compact=console.height < 45)
+
+    # Enter the alternate screen with a frame ready to paint (Apple Terminal:
+    # paint in place on the main buffer instead). A separate startup clear is
+    # redundant and can move old screen contents into history.
+    main_screen = _use_main_screen()
+    if main_screen:
+        painter = _MainScreenLive(render(), console)
+    else:
+        painter = Live(render(), console=console, screen=True, auto_refresh=False)
+    with painter as live:
+        terminal_size = console.size
         try:
             while True:
                 now     = time.monotonic()
                 elapsed = now - start_time
+                size = console.size
+                resized = size != terminal_size
+                if resized:
+                    # Clear cells left behind by the previous terminal dimensions.
+                    # Main-buffer frames already overwrite every cell, and a
+                    # clear there would push the frame into the scrollback.
+                    if not main_screen:
+                        console.clear()
+                    terminal_size = size
 
                 prev_kill_mode  = kill_mode
                 prev_kill_input = kill_input
@@ -521,16 +877,7 @@ def run(info: SystemInfo, interval: float = 1.0, top_n: int = 5,
                 if fw_frame < _FW_TOTAL_FRAMES:
                     cols, rows = shutil.get_terminal_size((80, 24))
                     # Refresh the dashboard first, then paint sparkles on top
-                    live.update(
-                        _build_renderable(info, snap, interval,
-                                          milestone_msg=milestone_msg,
-                                          disco=disco,
-                                          fact=milestone_override or current_fact,
-                                          fact_char_pos=fact_char_pos,
-                                          fact_anim_state=fact_anim_state,
-                                          fact_fade_step=fact_fade_step),
-                        refresh=True,
-                    )
+                    live.update(render(), refresh=True)
                     _draw_sparkle_overlay(
                         live.console.file, fw_frame, cols, rows, fw_bursts
                     )
@@ -538,19 +885,11 @@ def run(info: SystemInfo, interval: float = 1.0, top_n: int = 5,
                     time.sleep(_FW_FRAME_DURATION)
                     continue
 
-                # --- Kill mode: only redraw when input changes, skip collect ---
+                # --- Kill mode: redraw on input or resize, skip collect ---
                 if kill_mode:
-                    if kill_input != prev_kill_input or not prev_kill_mode:
-                        live.update(
-                            _build_renderable(info, snap, interval,
-                                              milestone_msg=milestone_msg, disco=disco,
-                                              kill_prompt=_build_kill_prompt(kill_input, kill_sig),
-                                              fact=milestone_override or current_fact,
-                                              fact_char_pos=fact_char_pos,
-                                              fact_anim_state=fact_anim_state,
-                                              fact_fade_step=fact_fade_step),
-                            refresh=True,
-                        )
+                    if kill_input != prev_kill_input or not prev_kill_mode or resized:
+                        live.update(render(_build_kill_prompt(kill_input, kill_sig)),
+                                    refresh=True)
                     time.sleep(0.05)
                     continue
 
@@ -558,15 +897,7 @@ def run(info: SystemInfo, interval: float = 1.0, top_n: int = 5,
 
                 # If kill mode just ended, clear the prompt immediately
                 if prev_kill_mode and not kill_mode:
-                    live.update(
-                        _build_renderable(info, snap, interval,
-                                          milestone_msg=milestone_msg, disco=disco,
-                                          fact=milestone_override or current_fact,
-                                          fact_char_pos=fact_char_pos,
-                                          fact_anim_state=fact_anim_state,
-                                          fact_fade_step=fact_fade_step),
-                        refresh=True,
-                    )
+                    live.update(render(), refresh=True)
 
                 # Collect hardware data at most once per interval
                 collected = False
@@ -574,6 +905,7 @@ def run(info: SystemInfo, interval: float = 1.0, top_n: int = 5,
                     snap = collect(top_n=top_n, proc_filter=proc_filter)
                     last_collect_time = now
                     collected = True
+                    history.push(snap)
 
                     # Auto-trigger fireworks when a core pegs 100 % for 5+ seconds
                     for i, pct in enumerate(snap.cpu_per_core):
@@ -639,18 +971,9 @@ def run(info: SystemInfo, interval: float = 1.0, top_n: int = 5,
                             fact_char_int       = _fact_char_interval(current_fact["text"])
                             fact_next_char_time = now
 
-                # Redraw only when data refreshed or fact animation advanced;
-                # this prevents disco mode from flickering at the loop tick rate.
-                if collected or fact_changed:
-                    live.update(
-                        _build_renderable(info, snap, interval,
-                                          milestone_msg=milestone_msg, disco=disco,
-                                          fact=milestone_override or current_fact,
-                                          fact_char_pos=fact_char_pos,
-                                          fact_anim_state=fact_anim_state,
-                                          fact_fade_step=fact_fade_step),
-                        refresh=True,
-                    )
+                # Redraw for data, animation, or window changes.
+                if collected or fact_changed or resized:
+                    live.update(render(), refresh=True)
                 time.sleep(_LOOP_TICK)
 
         except KeyboardInterrupt:
@@ -658,4 +981,4 @@ def run(info: SystemInfo, interval: float = 1.0, top_n: int = 5,
         finally:
             stop_event.set()
 
-    console.print("[dim]pulsar signing off. stay curious.[/dim]")
+    console.print(f"[bold {th.ACCENT}]◉[/] [{th.MUTED}]pulsar signing off. stay curious.[/]")

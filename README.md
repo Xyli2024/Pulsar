@@ -6,13 +6,14 @@ A live, terminal-native hardware dashboard for developers and researchers who ru
 
 ## Features
 
-- **Per-core CPU load** — colour-coded bars (green / yellow / red), switches to a compact heatmap grid for machines with more than 8 cores
+- **Per-core CPU load** — colour-coded bars arranged in multiple columns when space allows on machines with more than 8 cores
 - **CPU frequency per core** — live GHz reading alongside each core's load bar
 - **Memory pressure** — used vs. total with a live percentage bar
 - **Disk I/O throughput** — read and write MB/s, computed as a real-time delta
 - **Network I/O** — receive and send MB/s aggregated across all interfaces
 - **Top processes** — ranked by CPU%, showing PID, name, CPU%, and memory; press `k` / `K` to send SIGTERM / SIGKILL to any process by PID or name
-- **Fun facts bar** — rotating trivia at the bottom with a Pac-Man typing animation; 500+ built-in facts plus live fetches from Wikipedia *On This Day* and the web
+- **Power and sensors** — adapter, battery, system, CPU and GPU power in watts, plus GPU load, temperatures, fan speed and battery status where supported
+- **Fun facts bar** — 500+ built-in facts with a Pac-Man typing animation
 - **`--once --format json`** — machine-readable snapshot for logging, scripting, and data pipelines
 - **Disco mode** (`--disco`) — every element cycles through random terminal colours on each refresh
 - **Fireworks** — press `y` during the live dashboard, or triggers automatically when any core stays at 100% for 5+ seconds
@@ -95,6 +96,10 @@ See `pulsar_tutorial.ipynb` for a full walkthrough.
 - `psutil >= 5.9`
 - `rich >= 13.0`
 - `click >= 8.0`
+
+## Privacy
+
+Pulsar collects hardware and process statistics locally. Pulsar makes no network requests. Snapshots can contain process names and PIDs, so review them before sharing.
 
 ## Contributors
 

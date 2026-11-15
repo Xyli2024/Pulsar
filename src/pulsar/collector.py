@@ -1,4 +1,4 @@
-"""collector.py — hardware data collection via psutil."""
+"""collector.py — hardware data collection."""
 
 import platform
 import subprocess
@@ -6,6 +6,9 @@ import time
 from dataclasses import dataclass, field
 
 import psutil
+
+from .ioreport import read_component_power, read_cpu_frequencies
+from .power import read_power, read_registry_property, read_smc_values
 
 
 # ---------------------------------------------------------------------------
@@ -17,8 +20,8 @@ class SystemInfo:
     """Static hardware identity, read once at startup."""
     cpu_model: str
     cpu_cores: int
-    cpu_freq_current: float   # GHz
-    cpu_freq_max: float       # GHz
+    cpu_freq_current: float | None   # GHz
+    cpu_freq_max: float | None       # GHz
     gpu_model: str
     ram_total: float          # GB
 
@@ -35,9 +38,19 @@ class Snapshot:
     disk_write_mbps: float
     net_recv_mbps: float               # MB/s received across all interfaces
     net_sent_mbps: float               # MB/s sent across all interfaces
-    cpu_freq_per_core: list[float]     # current freq per logical core (GHz); [] if unavailable
+    cpu_freq_per_core: list[float | None]  # active frequency (GHz) by logical core
     top_procs: list[dict]              # list of {pid, name, cpu, mem_mb}
     timestamp: float = field(default_factory=time.time)
+    adapter_w: float | None = None
+    battery_w: float | None = None      # positive when charging, negative when discharging
+    system_w: float | None = None
+    gpu_percent: float | None = None
+    temperatures_c: dict[str, float] = field(default_factory=dict)
+    fans_rpm: dict[int, float] = field(default_factory=dict)
+    battery_percent: float | None = None
+    battery_status: str | None = None
+    cpu_w: float | None = None
+    gpu_w: float | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -84,10 +97,15 @@ def get_system_info() -> SystemInfo:
     """Read static hardware identity. Call once at startup."""
     try:
         freq = psutil.cpu_freq()
-    except AttributeError:
+    except (AttributeError, OSError, RuntimeError):
         freq = None
-    current_ghz = round(freq.current / 1000, 2) if freq else 0.0
-    max_ghz = round(freq.max / 1000, 2) if freq and freq.max else current_ghz
+    current_ghz = max_ghz = None
+    if freq is not None:
+        # On macOS psutil reports a nominal frequency as its current value.
+        if not psutil.MACOS and freq.current is not None and freq.current > 0:
+            current_ghz = round(freq.current / 1000, 2)
+        if freq.max is not None and freq.max > 0:
+            max_ghz = round(freq.max / 1000, 2)
 
     return SystemInfo(
         cpu_model=_get_cpu_model(),
@@ -119,19 +137,18 @@ def collect(top_n: int = 5, proc_filter: list[str] | None = None) -> Snapshot:
     cpu_per_core = psutil.cpu_percent(percpu=True, interval=None)
     cpu_avg = round(sum(cpu_per_core) / len(cpu_per_core), 1)
 
-    # CPU frequency per core (GHz); pad/truncate to match core count
-    try:
-        raw_freqs = psutil.cpu_freq(percpu=True)
-        if raw_freqs:
+    # Only show per-core frequencies when they map to the CPU usage rows.
+    cpu_freq_per_core = []
+    if psutil.MACOS:
+        cpu_freq_per_core = read_cpu_frequencies(len(cpu_per_core))
+    else:
+        try:
+            raw_freqs = psutil.cpu_freq(percpu=True)
+        except (AttributeError, OSError, RuntimeError):
+            raw_freqs = []
+        if (raw_freqs and len(raw_freqs) == len(cpu_per_core)
+                and all(f.current is not None and f.current > 0 for f in raw_freqs)):
             cpu_freq_per_core = [round(f.current / 1000, 2) for f in raw_freqs]
-            n = len(cpu_per_core)
-            if len(cpu_freq_per_core) < n:
-                cpu_freq_per_core += [cpu_freq_per_core[-1]] * (n - len(cpu_freq_per_core))
-            cpu_freq_per_core = cpu_freq_per_core[:n]
-        else:
-            cpu_freq_per_core = []
-    except Exception:
-        cpu_freq_per_core = []
 
     # Memory
     mem = psutil.virtual_memory()
@@ -186,6 +203,42 @@ def collect(top_n: int = 5, proc_filter: list[str] | None = None) -> Snapshot:
             continue
 
     procs.sort(key=lambda p: p["cpu"], reverse=True)
+    smc = read_smc_values(b"Tp01", b"Tp05", b"Tg05", b"TB0T", b"F0Ac", b"F1Ac")
+    temperatures_c = {}
+    for label, keys in (("CPU", (b"Tp01", b"Tp05")), ("GPU", (b"Tg05",)), ("Bat", (b"TB0T",))):
+        readings = [smc.get(key) for key in keys]
+        valid = [value for value in readings if value is not None and 0 < value < 130]
+        if valid:
+            temperatures_c[label] = max(valid)
+    fans_rpm = {}
+    for index, key in enumerate((b"F0Ac", b"F1Ac"), start=1):
+        value = smc.get(key)
+        if value is not None and value >= 0:
+            fans_rpm[index] = value
+
+    gpu_stats = read_registry_property(b"IOAccelerator", b"PerformanceStatistics")
+    gpu_percent = gpu_stats.get("Device Utilization %") if isinstance(gpu_stats, dict) else None
+    if gpu_percent is not None and (type(gpu_percent) not in (int, float) or not 0 <= gpu_percent <= 100):
+        gpu_percent = None
+
+    try:
+        battery = psutil.sensors_battery()
+    except (AttributeError, OSError, RuntimeError):
+        battery = None
+    plugged = battery.power_plugged if battery is not None else None
+    battery_status = None
+    if plugged is False:
+        battery_status = "On battery"
+    elif plugged is True:
+        charging = read_registry_property(b"AppleSmartBattery", b"IsCharging")
+        if charging is True:
+            battery_status = "Charging"
+        elif charging is False:
+            battery_status = "Not charging"
+        else:
+            battery_status = "Plugged in"
+    adapter_w, battery_w, system_w = read_power(smc, plugged=plugged)
+    cpu_w, gpu_w = read_component_power()
 
     return Snapshot(
         cpu_per_core=[round(p, 1) for p in cpu_per_core],
@@ -199,4 +252,14 @@ def collect(top_n: int = 5, proc_filter: list[str] | None = None) -> Snapshot:
         net_sent_mbps=sent_mbps,
         cpu_freq_per_core=cpu_freq_per_core,
         top_procs=procs[:top_n],
+        adapter_w=adapter_w,
+        battery_w=battery_w,
+        system_w=system_w,
+        gpu_percent=gpu_percent,
+        temperatures_c=temperatures_c,
+        fans_rpm=fans_rpm,
+        battery_percent=battery.percent if battery is not None and 0 <= battery.percent <= 100 else None,
+        battery_status=battery_status,
+        cpu_w=cpu_w,
+        gpu_w=gpu_w,
     )

@@ -1,14 +1,9 @@
 """facts.py — rotating fun-fact library for the dashboard footer.
 
 Local library: 500+ facts across 20+ categories.
-Online supplement: Wikipedia On This Day + uselessfacts.jsph.pl (background thread).
 """
 
-import json
 import random
-import threading
-from datetime import datetime
-from urllib.request import urlopen, Request
 
 # ---------------------------------------------------------------------------
 # Local fact library  (500 entries)
@@ -610,80 +605,6 @@ _LOCAL_FACTS += [
 # Shuffle the local pool once at import time so every run has a different order
 random.shuffle(_LOCAL_FACTS)
 
-# ---------------------------------------------------------------------------
-# Shared pool — starts with local facts, online facts are appended
-# ---------------------------------------------------------------------------
-
-_fact_pool: list[dict] = list(_LOCAL_FACTS)
-_pool_lock = threading.Lock()
-
-
-def start_online_fetch() -> None:
-    """Kick off a background thread that fetches online facts (best-effort)."""
-
-    def _worker() -> None:
-        import time as _time
-        new_facts: list[dict] = []
-
-        # ── Wikipedia On This Day ─────────────────────────────────────
-        try:
-            now = datetime.now()
-            url = (
-                f"https://en.wikipedia.org/api/rest_v1/feed/onthisday"
-                f"/events/{now.month}/{now.day}"
-            )
-            req = Request(url, headers={"User-Agent": "pulsar-dashboard/0.1"})
-            with urlopen(req, timeout=6) as resp:
-                data = json.loads(resp.read())
-            events = data.get("events", [])
-            random.shuffle(events)
-            for ev in events[:8]:
-                year = ev.get("year", "")
-                text = ev.get("text", "").strip()
-                if text and year:
-                    new_facts.append({
-                        "tag": "Today in History",
-                        "color": "yellow",
-                        "text": f"{year} — {text}",
-                    })
-        except Exception:
-            pass
-
-        # ── Useless Facts API ─────────────────────────────────────────
-        try:
-            for _ in range(6):
-                req = Request(
-                    "https://uselessfacts.jsph.pl/api/v2/facts/random",
-                    headers={"User-Agent": "pulsar-dashboard/0.1"},
-                )
-                with urlopen(req, timeout=5) as resp:
-                    data = json.loads(resp.read())
-                text = data.get("text", "").strip()
-                if text:
-                    new_facts.append({
-                        "tag": "Fun Fact",
-                        "color": "bright_magenta",
-                        "text": text,
-                    })
-                _time.sleep(0.4)
-        except Exception:
-            pass
-
-        if new_facts:
-            with _pool_lock:
-                _fact_pool.extend(new_facts)
-                random.shuffle(_fact_pool)
-
-    threading.Thread(target=_worker, daemon=True).start()
-
-
 def get_fact(index: int) -> dict:
     """Return the fact at position *index* (wraps around the pool)."""
-    with _pool_lock:
-        return _fact_pool[index % len(_fact_pool)]
-
-
-def pool_size() -> int:
-    """Current number of facts in the pool."""
-    with _pool_lock:
-        return len(_fact_pool)
+    return _LOCAL_FACTS[index % len(_LOCAL_FACTS)]
