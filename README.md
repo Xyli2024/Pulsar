@@ -107,6 +107,7 @@ Pulsar collects hardware and process statistics locally. Pulsar makes no network
 |---|---|
 | [Xyli2024](https://github.com/Xyli2024) | Author |
 | [Claude (Anthropic)](https://www.anthropic.com/claude) | AI Assistant |
+| Codex (OpenAI) | AI Assistant |
 
 ## License
 
